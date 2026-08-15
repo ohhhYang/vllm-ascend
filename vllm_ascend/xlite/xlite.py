@@ -301,7 +301,9 @@ class StandardXliteModel(XliteModelBase):
             xlite_config.rope_theta = getattr(hf_config, "rope_parameters", {}).get("rope_theta", 10000.0)
         xlite_config.softmax_scale = xlite_config.head_dim**-0.5
         xlite_config.n_dense_layers = hf_config.num_hidden_layers
-        xlite_config.intermediate_size = hf_config.intermediate_size
+        xlite_config.intermediate_size = getattr(
+            hf_config, "intermediate_size", getattr(hf_config, "moe_intermediate_size", 0)
+        )
         xlite_config.def_tp_size = tp_size = get_tensor_model_parallel_world_size()
         xlite_config.def_dp_size = vllm_config.parallel_config.data_parallel_size
         try:
@@ -656,6 +658,17 @@ def _gemma_norm_to_xlite(weight: torch.Tensor) -> torch.Tensor:
     return (weight.float() + 1.0).to(weight.dtype).contiguous()
 
 
+def _flatten_expert_weights(weights: list[torch.Tensor]) -> list[torch.Tensor]:
+    """Unbind packed ``[E, ...]`` expert tensors into per-expert 2D views."""
+    flat: list[torch.Tensor] = []
+    for weight in weights:
+        if weight.dim() >= 3:
+            flat.extend(t.contiguous() for t in weight.unbind(0))
+        else:
+            flat.append(weight if weight.is_contiguous() else weight.contiguous())
+    return flat
+
+
 def _pack_mha_qkv_with_gate(
     qkv_weight: torch.Tensor,
     head_dim: int,
@@ -716,7 +729,10 @@ def _resolve_full_attention_interval(hf_config: PretrainedConfig) -> int:
 
 
 class Qwen3_5XliteModel(StandardXliteModel):
-    """xlite adapter for dense Qwen3.5 hybrid (MHA + GDN)."""
+    """xlite adapter for dense Qwen3.5 hybrid (MHA + GDN).
+
+    Qwen3.5-MoE (hybrid attention + Sparse MoE) is handled by :class:`Qwen3_5MoeXliteModel`.
+    """
 
     _attn_metadata_type = AscendMetadata
     _supported_architectures = ["Qwen3_5ForCausalLM", "Qwen3_5ForConditionalGeneration"]
@@ -782,8 +798,14 @@ class Qwen3_5XliteModel(StandardXliteModel):
             self._xlite_weight_refs.extend([an, mn])
             lists["attn_norm"].append(an)
             lists["mlp_norm"].append(mn)
-            lists["mlp_up_gate"].append(layer.mlp.gate_up_proj.weight)
-            lists["mlp_down"].append(layer.mlp.down_proj.weight)
+            mlp = layer.mlp
+            if hasattr(mlp, "gate_up_proj") and hasattr(mlp, "down_proj"):
+                lists["mlp_up_gate"].append(mlp.gate_up_proj.weight)
+                lists["mlp_down"].append(mlp.down_proj.weight)
+            else:
+                # Sparse MoE layers (Qwen3.5-MoE) have no dense SwiGLU projections.
+                lists["mlp_up_gate"].append(empty)
+                lists["mlp_down"].append(empty)
 
             layer_type = getattr(layer, "layer_type", None)
             is_full = (layer_type == "full_attention") if layer_type is not None else hasattr(layer, "self_attn")
@@ -836,13 +858,113 @@ class Qwen3_5XliteModel(StandardXliteModel):
                 lists["linear_norm"].append(la.norm.weight)
                 lists["linear_out_proj"].append(la.out_proj.weight)
 
+        skip_empty_dense_mlp = all(t.numel() == 0 for t in lists["mlp_up_gate"])
         for k, v in lists.items():
             if k == "mha_qkv_bias" and not has_qkv_bias:
+                continue
+            if skip_empty_dense_mlp and k in ("mlp_up_gate", "mlp_down"):
                 continue
             setattr(xm, k, v)
         cfg.qk_norm = True
         cfg.qkv_bias = has_qkv_bias
+        self._load_moe_weights(layers)
 
+    def _load_moe_weights(self, layers: Sequence[nn.Module]) -> None:
+        """Load Sparse MoE weights. Dense Qwen3.5 has no experts."""
+        del layers
+
+
+class Qwen3_5MoeXliteModel(Qwen3_5XliteModel):
+    """xlite adapter for Qwen3.5 MoE hybrid (MHA + GDN + Sparse MoE)."""
+
+    _supported_architectures = ["Qwen3_5MoeForCausalLM", "Qwen3_5MoeForConditionalGeneration"]
+
+    def _build_model_config(self) -> None:
+        super()._build_model_config()
+        cfg, hf = self.xlite_config, self.hf_text_config
+
+        cfg.n_dense_layers = 0
+        cfg.n_routed_experts = hf.num_experts
+        shared_inter = int(getattr(hf, "shared_expert_intermediate_size", 0) or 0)
+        cfg.n_shared_experts = 1 if shared_inter > 0 else 0
+        cfg.n_act_experts = hf.num_experts_per_tok
+        cfg.moe_intermediate_size = hf.moe_intermediate_size
+        cfg.norm_topk_prob = bool(getattr(hf, "norm_topk_prob", True))
+        cfg.scoring_func = ScoringFuncSoftmax
+
+    def _load_moe_weights(self, layers: Sequence[nn.Module]) -> None:
+        xm, cfg = self.xlite_model, self.xlite_config
+        mlp_prefix = self._decoder_layer_mlp_module
+
+        xm.gate = get_layer_weights(layers, f"{mlp_prefix}.gate.weight")
+        xm.gate_bias = get_layer_weights(
+            layers,
+            f"{mlp_prefix}.gate.e_score_correction_bias",
+            f"{mlp_prefix}.e_score_correction_bias",
+            post_processor=lambda b: b.to(torch.float32),
+        )
+        # Qwen3.5 / Qwen3-Next use singular `shared_expert` plus a sigmoid gate.
+        self.init_matmul_weights(layers, "se_up_gate", f"{mlp_prefix}.shared_expert.gate_up_proj")
+        self.init_matmul_weights(layers, "se_down", f"{mlp_prefix}.shared_expert.down_proj")
+        # C++ se_gate forward is still untested; skip for now. Shared stays ungated.
+        se_up = getattr(xm, "se_up_gate", None) or []
+        se_down = getattr(xm, "se_down", None) or []
+        if se_up and se_down:
+            # C++ treats shared as "full" when up rows == 2*moe_intermediate (not TP-sharded).
+            # Full + all-ranks compute => shared*TP after AllReduce => garble.
+            se0, sd0 = se_up[0], se_down[0]
+            expect_full_up = int(cfg.moe_intermediate_size) * 2
+            looks_full = se0.dim() >= 2 and (
+                se0.shape[0] == expect_full_up or (se0.dim() > 1 and se0.shape[1] == expect_full_up)
+            )
+            logger.info(
+                "xlite Qwen3.5 MoE shared se_up[0]=%s se_down[0]=%s looks_full=%s "
+                "(expect_full_up_rows=%s moe_inter=%s)",
+                tuple(se0.shape),
+                tuple(sd0.shape),
+                looks_full,
+                expect_full_up,
+                cfg.moe_intermediate_size,
+            )
+
+        re_prefix = f"{mlp_prefix}.experts.routed_experts"
+        re_kwargs: WeightGetterConfig = {"secondary_flattening": f"{re_prefix}.local_num_experts"}
+        re_up = get_layer_weights(layers, f"{re_prefix}.w13_weight", **re_kwargs)
+        re_down = get_layer_weights(layers, f"{re_prefix}.w2_weight", **re_kwargs)
+        if not re_up:
+            re_prefix = f"{mlp_prefix}.experts"
+            re_kwargs = {"secondary_flattening": f"{re_prefix}.local_num_experts"}
+            re_up = get_layer_weights(layers, f"{re_prefix}.w13_weight", **re_kwargs)
+            re_down = get_layer_weights(layers, f"{re_prefix}.w2_weight", **re_kwargs)
+        re_up = _flatten_expert_weights(re_up)
+        re_down = _flatten_expert_weights(re_down)
+        xm.re_up_gate = re_up
+        xm.re_down = re_down
+        cfg.experts_weight_nz = bool(re_up) and self.is_tensor_nz(re_up[0])
+        # xlite group_matmul transpose=True means [K, N] (in, out). Ascend fused-MoE
+        # does w13/w2.transpose(1, 2) from Linear [E, N, K] to [E, K, N]. Infer from
+        # the actual 2D slice so we do not depend on whether that transpose ran.
+        if re_up:
+            w0 = re_up[0]
+            if w0.dim() == 2 and w0.shape[0] == cfg.hidden_size:
+                cfg.experts_weight_transpose = True
+            elif w0.dim() == 2 and w0.shape[1] == cfg.hidden_size:
+                cfg.experts_weight_transpose = False
+            logger.info(
+                "xlite Qwen3.5 MoE expert[0] shape=%s down[0] shape=%s transpose=%s ep=%s moe_tp=%s",
+                tuple(w0.shape),
+                tuple(re_down[0].shape) if re_down else None,
+                cfg.experts_weight_transpose,
+                cfg.moe_ep_size,
+                cfg.moe_tp_size,
+            )
+
+        if not self.quantization:
+            return
+
+        re_kwargs["post_processor"] = self._transform_deq_scale
+        xm.re_up_gate_scale = get_layer_weights(layers, f"{re_prefix}.w13_weight_scale", **re_kwargs)
+        xm.re_down_scale = get_layer_weights(layers, f"{re_prefix}.w2_weight_scale", **re_kwargs)
 
 
 def get_adapter_xlite_model(runnable: nn.Module, vllm_config: VllmConfig) -> XliteModelBase:
