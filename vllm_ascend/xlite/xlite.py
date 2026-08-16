@@ -903,10 +903,10 @@ class Qwen3_5MoeXliteModel(Qwen3_5XliteModel):
             f"{mlp_prefix}.e_score_correction_bias",
             post_processor=lambda b: b.to(torch.float32),
         )
-        # Qwen3.5 / Qwen3-Next use singular `shared_expert` plus a sigmoid gate.
+        # Qwen3.5 / Qwen3-Next: y = routed + sigmoid(se_gate(x)) * shared(x)
         self.init_matmul_weights(layers, "se_up_gate", f"{mlp_prefix}.shared_expert.gate_up_proj")
         self.init_matmul_weights(layers, "se_down", f"{mlp_prefix}.shared_expert.down_proj")
-        # C++ se_gate forward is still untested; skip for now. Shared stays ungated.
+        xm.se_gate = get_layer_weights(layers, f"{mlp_prefix}.shared_expert_gate.weight")
         se_up = getattr(xm, "se_up_gate", None) or []
         se_down = getattr(xm, "se_down", None) or []
         if se_up and se_down:
@@ -918,10 +918,11 @@ class Qwen3_5MoeXliteModel(Qwen3_5XliteModel):
                 se0.shape[0] == expect_full_up or (se0.dim() > 1 and se0.shape[1] == expect_full_up)
             )
             logger.info(
-                "xlite Qwen3.5 MoE shared se_up[0]=%s se_down[0]=%s looks_full=%s "
+                "xlite Qwen3.5 MoE shared se_up[0]=%s se_down[0]=%s se_gate[0]=%s looks_full=%s "
                 "(expect_full_up_rows=%s moe_inter=%s)",
                 tuple(se0.shape),
                 tuple(sd0.shape),
+                tuple(xm.se_gate[0].shape) if getattr(xm, "se_gate", None) else None,
                 looks_full,
                 expect_full_up,
                 cfg.moe_intermediate_size,
@@ -1160,20 +1161,40 @@ class XliteWrapper:
         """
         forward_context = get_forward_context()
         is_hybrid = self.adapter_xlite_model.xlite_config.attn_type == AttnHybrid
+
+        def _ensure_output(out: Any, path: str) -> XliteForwardResult:
+            if out is None:
+                raise RuntimeError(
+                    f"XliteWrapper got None from {path} "
+                    f"(full_mode={self.full_mode}, hybrid={is_hybrid}, "
+                    f"runnable={type(self.runnable).__name__})"
+                )
+            return out
+
         if getattr(forward_context, "in_profile_run", False) or (
             is_hybrid and getattr(forward_context, "capturing", False)
         ):
-            if self.full_mode and getattr(forward_context, "in_profile_run", False):
-                # In full mode, xlite handles both prefill and decode, and aclgraph runnable should not reserve memory.
-                # This is to avoid redundant memory allocation that reduces KV cache capacity and regresses performance.
+            # full_mode hybrid: never capture/run Ascend-GDN runnable here — state is not
+            # sync-compatible with xlite, and ACLGraph weak-refs of runnable output can
+            # become None on replay.
+            if self.full_mode and (
+                getattr(forward_context, "in_profile_run", False)
+                or (is_hybrid and getattr(forward_context, "capturing", False))
+            ):
                 # NOTE: returning a single hidden state tensor may break the vLLM pipeline if the runnable expects a
                 # tuple of outputs, e.g., (hidden_states, aux_hidden_states) under certain speculative scenarios
-                return self.hidden_states
-            return self.runnable(input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs)
+                return _ensure_output(self.hidden_states, "full_mode profile/capture placeholder")
+            return _ensure_output(
+                self.runnable(input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs),
+                "runnable(profile/capturing)",
+            )
 
         attn_metadata_raw: Any = forward_context.attn_metadata
         if attn_metadata_raw is None:
-            return self.runnable(input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs)
+            return _ensure_output(
+                self.runnable(input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs),
+                "runnable(attn_metadata=None)",
+            )
 
         if is_hybrid:
             attn_metadata = self._pick_attn_metadata(attn_metadata_raw, self.adapter_xlite_model._attn_metadata_type)
@@ -1186,7 +1207,10 @@ class XliteWrapper:
             if not isinstance(attn_metadata, self.adapter_xlite_model._attn_metadata_type):
                 attn_metadata = None
         if attn_metadata is None:
-            return self.runnable(input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs)
+            return _ensure_output(
+                self.runnable(input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs),
+                "runnable(attn_metadata type mismatch)",
+            )
 
         with_prefill = attn_metadata.attn_state not in (
             AscendAttentionState.DecodeOnly,
@@ -1208,7 +1232,10 @@ class XliteWrapper:
         if not use_xlite_graph:
             # fall back to runnable for prefill in decode-only mode
             # or when the number of tokens exceeds the graph capacity in non-full mode
-            return self.runnable(input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs)
+            return _ensure_output(
+                self.runnable(input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs),
+                "runnable(not use_xlite_graph)",
+            )
 
         if is_hybrid:
             num_reqs = int(getattr(attn_metadata, "num_decodes", 0) or 0) + int(
@@ -1233,11 +1260,17 @@ class XliteWrapper:
             query_lens_list = [int(x) for x in query_lens_list[:num_reqs]]
             seq_lens_list = [int(x) for x in seq_lens_list[:num_reqs]]
             if len(seq_lens_list) < num_reqs or len(query_lens_list) < num_reqs:
-                return self.runnable(input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs)
+                return _ensure_output(
+                    self.runnable(input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs),
+                    "runnable(hybrid lens mismatch)",
+                )
             cached_lens_list = [max(seq_lens_list[i] - query_lens_list[i], 0) for i in range(num_reqs)]
             bt = getattr(attn_metadata, "block_tables", None)
             if bt is None:
-                return self.runnable(input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs)
+                return _ensure_output(
+                    self.runnable(input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs),
+                    "runnable(hybrid block_tables=None)",
+                )
             block_tables_list = (
                 bt[:num_reqs].detach().to("cpu").tolist()
                 if hasattr(bt, "device") and bt.device.type != "cpu"
@@ -1245,11 +1278,17 @@ class XliteWrapper:
             )
             num_actual_tokens = int(attn_metadata.num_actual_tokens)
             if sum(query_lens_list) != num_actual_tokens:
-                return self.runnable(input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs)
+                return _ensure_output(
+                    self.runnable(input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs),
+                    "runnable(hybrid query_lens sum mismatch)",
+                )
             # Refuse capture/dummy all-zero tables on decode.
             for i, cached in enumerate(cached_lens_list):
                 if cached > 0 and int(block_tables_list[i][0]) == 0:
-                    return self.runnable(input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs)
+                    return _ensure_output(
+                        self.runnable(input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs),
+                        "runnable(hybrid dummy block_table)",
+                    )
             xlite_attn_metadata = AttnMeta()
             xlite_attn_metadata.lens = query_lens_list
             xlite_attn_metadata.cached_lens = cached_lens_list
@@ -1272,7 +1311,7 @@ class XliteWrapper:
                 )
                 if xlite_deepstack and hasattr(self.runnable, "_clear_deepstack_input_embeds"):
                     self.runnable._clear_deepstack_input_embeds(emb.size(0))
-            return h[:num_actual_tokens]
+            return _ensure_output(h[:num_actual_tokens], "xlite hybrid forward")
 
         attn_metadata_router = AttnMetadataRouter(attn_metadata=attn_metadata, device="cpu")
         seq_lens = attn_metadata_router.seq_lens
@@ -1317,4 +1356,4 @@ class XliteWrapper:
             )
             if xlite_deepstack_input_embeds and hasattr(self.runnable, "_clear_deepstack_input_embeds"):
                 self.runnable._clear_deepstack_input_embeds(inputs_embeds.size(0))
-        return h[:num_actual_tokens]
+        return _ensure_output(h[:num_actual_tokens], "xlite forward")
