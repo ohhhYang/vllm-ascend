@@ -1116,6 +1116,12 @@ class XliteWrapper:
                     k.view(k.shape[0] * chunk, block_size, kv_heads, head_dim),
                     v.view(v.shape[0] * chunk, block_size, kv_heads, head_dim),
                 )
+            # DEBUG(xlite-mtp): dump real layout before raising
+            logger.error(
+                "xlite-mtp DEBUG as_kv: group_len=%d shapes=%s dtypes=%s "
+                "expect block_size=%s kv_heads=%s head_dim=%s",
+                len(ts), [tuple(t.shape) for t in ts], [str(t.dtype) for t in ts],
+                block_size, kv_heads, head_dim)
             raise RuntimeError(
                 f"full-attn KV layout mismatch: {tuple(k.shape)}, expect [*,{block_size},{kv_heads},{head_dim}]"
             )
