@@ -18,7 +18,10 @@
 
 from __future__ import annotations
 
+import json
 import math
+import os
+import time
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Sequence
 from typing import Any, TypeAlias, cast
@@ -32,7 +35,8 @@ from vllm.distributed import get_ep_group, get_tensor_model_parallel_world_size
 from vllm.forward_context import get_forward_context
 from vllm.logger import logger
 from vllm.sequence import IntermediateTensors
-from xlite._C import AttnDSA, AttnHybrid, AttnMeta, AttnMHA, AttnMLA, Runtime, ScoringFuncSigmoid, ScoringFuncSoftmax
+from xlite._C import AttnDSA, AttnHybrid, AttnMeta, AttnMetaV2, AttnMHA, AttnMLA, Runtime, ScoringFuncSigmoid, ScoringFuncSoftmax
+from xlite._C import graph_capture_begin, graph_capture_end, graph_destroy, graph_exec
 
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.attention.attention_v1 import AscendAttentionBackend, AscendAttentionState, AscendMetadata
@@ -1029,6 +1033,30 @@ class XliteWrapper:
         max_num_tokens = vllm_config.scheduler_config.max_num_batched_tokens
         self.hidden_states = torch.empty(max_num_tokens, hidden_size, device=self.device, dtype=dtype)
 
+        # Decode graph capture (XLITE_DECODE_GRAPH=1): per-batch-size ACL graph
+        # of the whole xlite decode forward, replayed with static I/O buffers.
+        self._dg_entries: dict = {}
+        self._dg_warm: dict = {}
+        self._dg_disabled: bool = False
+        self._dg_max_blocks: int = max(1, vllm_config.model_config.max_model_len //
+                                       vllm_config.cache_config.block_size)
+
+    def _dg_meta_host(self, num_reqs, cached_lens_list, block_tables_list):
+        """Replicate C++ PrepareAttn V1 host logic exactly (xlite formula):
+        slot = block_tables[i][cached//bs] * bs + cached%bs; blockTables padded
+        to fixed width [B, dg_max_blocks] int32 (constant across replays)."""
+        bs0 = 128  # xlite blockSizes[0] == vllm cache block_size (serve flag)
+        slots = []
+        bt = torch.zeros(num_reqs, self._dg_max_blocks, dtype=torch.int32)
+        for i in range(num_reqs):
+            cl = int(cached_lens_list[i])
+            row = block_tables_list[i]
+            slots.append(int(row[cl // bs0]) * bs0 + cl % bs0)
+            n = min(len(row), self._dg_max_blocks)
+            if n > 0:
+                bt[i, :n] = torch.tensor(row[:n], dtype=torch.int32)
+        return torch.tensor(slots, dtype=torch.int32), bt
+
     def __getattr__(self, key: str) -> Any:
         """Proxy unknown attributes to the wrapped runnable model.
 
@@ -1266,6 +1294,104 @@ class XliteWrapper:
             self._hybrid_copy(idx, to_batch=False)
             self._xlite_hybrid_dirty = False
 
+    def _dg_capture(self, inputs_embeds, positions, slot_mapping, block_tables, seq_lens,
+                    num_reqs, cached_lens_list, stream):
+        """Capture the whole xlite decode forward as an ACL graph for batch=num_reqs."""
+        dev = self.device
+        pos = (positions[0] if positions.ndim == 2 else positions)[:num_reqs].contiguous()
+        emb_s = inputs_embeds[:num_reqs].contiguous().clone()
+        pos_s = pos.clone()
+        lens_s = torch.ones(num_reqs, dtype=torch.int32, device=dev)
+        # NOTE: attn_metadata.seq_lens may live on CPU — must transfer to device,
+        # otherwise the C++ V2 alias path bakes a HOST pointer into the kernel
+        # args and the attention kernel faults (D-cache/UB bus error).
+        cached_s = (seq_lens[:num_reqs].to(device=dev, dtype=torch.int32) - 1).contiguous()
+        qsl_s = torch.arange(num_reqs, dtype=torch.int32, device=dev)
+        slot_s = slot_mapping[:num_reqs].to(torch.int32).contiguous().clone()
+        bt_s = block_tables[:num_reqs].to(torch.int32).contiguous().clone()
+        meta = AttnMetaV2()
+        meta.lens = lens_s
+        meta.cached_lens = cached_s
+        meta.query_start_loc = qsl_s
+        meta.positions = pos_s
+        meta.slot_mapping = [slot_s]
+        meta.block_tables = [bt_s]
+        meta.lens_cpu = [1] * num_reqs
+        meta.cached_lens_cpu = [int(x) for x in cached_lens_list[:num_reqs]]
+        # Defensive: every tensor handed to the zero-copy V2 path must be on NPU.
+        for _name, _t in (("lens", lens_s), ("cached_lens", cached_s),
+                          ("query_start_loc", qsl_s), ("positions", pos_s),
+                          ("slot_mapping", slot_s), ("block_tables", bt_s)):
+            if _t.device.type == "cpu":
+                raise RuntimeError(f"xlite decode graph: meta tensor {_name} is on CPU")
+        h = self.hidden_states[:num_reqs]
+        graph_capture_begin(self.xlite_rt)
+        try:
+            # curr_stream=UINT64_MAX: no event ops / synchronize inside capture.
+            self.xlite_model.forward_with_inputs_embeds_v2(
+                self.xlite_rt, emb_s, meta, self.kv_caches, self.freq_cis, h,
+                0xFFFFFFFFFFFFFFFF, [])
+            handle = graph_capture_end(self.xlite_rt)
+        except Exception:
+            try:
+                graph_capture_end(self.xlite_rt)
+            except Exception:
+                pass
+            raise
+        ent = {"handle": handle, "emb": emb_s, "pos": pos_s, "cached": cached_s,
+               "slot": slot_s, "bt": bt_s, "meta": meta, "bt_width": bt_s.shape[1]}
+        self._dg_entries[num_reqs] = ent
+        logger.info("xlite decode graph: captured bs=%d (cached_lens=%s, bt_width=%d)",
+                    num_reqs, [int(x) for x in cached_lens_list[:num_reqs]], bt_s.shape[1])
+        return ent
+
+    def _decode_graph_step(self, inputs_embeds, positions, attn_metadata, num_reqs,
+                           cached_lens_list, stream):
+        """Replay (or capture-on-first-use) the decode graph. Returns output or None."""
+        if self._dg_disabled:
+            return None
+        slot_mapping = getattr(attn_metadata, "slot_mapping", None)
+        block_tables = getattr(attn_metadata, "block_tables", None)
+        seq_lens = getattr(attn_metadata, "seq_lens", None)
+        if slot_mapping is None or block_tables is None or seq_lens is None:
+            if not getattr(self, "_dg_attr_logged", False):
+                self._dg_attr_logged = True
+                logger.warning(
+                    "xlite decode graph: meta attr missing (slot_mapping=%s block_tables=%s seq_lens=%s, meta=%s)",
+                    type(slot_mapping).__name__, type(block_tables).__name__,
+                    type(seq_lens).__name__, type(attn_metadata).__name__)
+            return None
+        try:
+            ent = self._dg_entries.get(num_reqs)
+            if ent is None:
+                # Warm up: run a few eager decode steps per batch size first so
+                # every decode-variant kernel binary is loaded BEFORE capture
+                # (lazy binary loading during capture crashes the runtime).
+                warm = self._dg_warm.get(num_reqs, 0)
+                if warm < 3:
+                    self._dg_warm[num_reqs] = warm + 1
+                    return None
+                ent = self._dg_capture(inputs_embeds, positions, slot_mapping, block_tables,
+                                       seq_lens, num_reqs, cached_lens_list, stream)
+                logger.info("xlite decode graph: first exec bs=%d", num_reqs)
+                # capture does not execute: run the graph for this step too
+                graph_exec(self.xlite_rt, ent["handle"], stream)
+            else:
+                if block_tables.shape[1] > ent["bt_width"]:
+                    return None  # context outgrew captured table width
+                ent["emb"].copy_(inputs_embeds[:num_reqs])
+                pos = (positions[0] if positions.ndim == 2 else positions)[:num_reqs]
+                ent["pos"].copy_(pos)
+                ent["cached"].copy_(seq_lens[:num_reqs].to(torch.int32) - 1)
+                ent["slot"].copy_(slot_mapping[:num_reqs].to(torch.int32))
+                ent["bt"][:, :block_tables.shape[1]].copy_(block_tables[:num_reqs])
+                graph_exec(self.xlite_rt, ent["handle"], stream)
+            return self.hidden_states[:num_reqs]
+        except Exception as e:
+            logger.warning("xlite decode graph disabled after error: %s", e)
+            self._dg_disabled = True
+            return None
+
     def __call__(
         self,
         input_ids: torch.Tensor,
@@ -1366,6 +1492,17 @@ class XliteWrapper:
             )
 
         if is_hybrid:
+            _adp_prof = os.environ.get("XLITE_ADAPTER_PROF", "0") == "1"
+            _adp_t0 = time.perf_counter()
+            _adp_last = [_adp_t0]
+            _adp_marks: list = []
+
+            def _adp_mark(name: str) -> None:
+                if _adp_prof:
+                    now = time.perf_counter()
+                    _adp_marks.append((name, (now - _adp_last[0]) * 1000))
+                    _adp_last[0] = now
+
             num_reqs = int(getattr(attn_metadata, "num_decodes", 0) or 0) + int(
                 getattr(attn_metadata, "num_prefills", 0) or 0
             )
@@ -1393,6 +1530,7 @@ class XliteWrapper:
                     "runnable(hybrid lens mismatch)",
                 )
             cached_lens_list = [max(seq_lens_list[i] - query_lens_list[i], 0) for i in range(num_reqs)]
+            _adp_mark("lens")
             bt = getattr(attn_metadata, "block_tables", None)
             if bt is None:
                 return _ensure_output(
@@ -1404,6 +1542,7 @@ class XliteWrapper:
                 if hasattr(bt, "device") and bt.device.type != "cpu"
                 else bt[:num_reqs].tolist()
             )
+            _adp_mark("block_tables")
             num_actual_tokens = int(attn_metadata.num_actual_tokens)
             if sum(query_lens_list) != num_actual_tokens:
                 return _ensure_output(
@@ -1411,6 +1550,35 @@ class XliteWrapper:
                     "runnable(hybrid query_lens sum mismatch)",
                 )
             self._hybrid_gather(self._gdn_state_ids(attn_metadata_raw, num_reqs), cached_lens_list, num_reqs)
+            _adp_mark("gdn_gather")
+            stream = torch.npu.current_stream().npu_stream
+            if (os.environ.get("XLITE_DECODE_GRAPH", "0") == "1"
+                    and inputs_embeds is not None and num_reqs == num_actual_tokens
+                    and all(q == 1 for q in query_lens_list)):
+                _dg_out = self._decode_graph_step(
+                    inputs_embeds, positions, attn_metadata, num_reqs, cached_lens_list, stream)
+                if _dg_out is not None:
+                    _adp_mark("decode_graph")
+                    self._hybrid_scatter()
+                    _adp_mark("scatter")
+                    if _adp_prof:
+                        try:
+                            with open(os.environ.get("XLITE_ADAPTER_PROF_OUT", "/tmp/opencode/adapter_prof.jsonl"), "a") as _f:
+                                _f.write(json.dumps({
+                                    "num_reqs": num_reqs, "num_tokens": num_actual_tokens,
+                                    "with_prefill": bool(with_prefill), "decode_graph": True,
+                                    "total_ms": (_adp_last[0] - _adp_t0) * 1000,
+                                    "marks": dict(_adp_marks),
+                                }) + "\n")
+                        except Exception:
+                            pass
+                    return _ensure_output(_dg_out, "xlite hybrid decode graph")
+            elif not getattr(self, "_dg_cond_logged", False):
+                self._dg_cond_logged = True
+                logger.warning(
+                    "xlite decode graph: condition false (env=%s embeds_none=%s num_reqs=%s num_tokens=%s qlens=%s)",
+                    os.environ.get("XLITE_DECODE_GRAPH"), inputs_embeds is None,
+                    num_reqs, num_actual_tokens, query_lens_list[:4])
             xlite_attn_metadata = AttnMeta()
             xlite_attn_metadata.lens = query_lens_list
             xlite_attn_metadata.cached_lens = cached_lens_list
@@ -1419,6 +1587,7 @@ class XliteWrapper:
             xlite_attn_metadata.positions = pos[:num_actual_tokens].contiguous()
             num_tokens = getattr(forward_context, "max_tokens_across_dp", None) or forward_context.batch_descriptor.num_tokens
             h = self.hidden_states[:num_tokens]
+            _adp_mark("meta_build")
             stream = torch.npu.current_stream().npu_stream
             if inputs_embeds is None:
                 self.xlite_model.forward(
@@ -1433,7 +1602,20 @@ class XliteWrapper:
                 )
                 if xlite_deepstack and hasattr(self.runnable, "_clear_deepstack_input_embeds"):
                     self.runnable._clear_deepstack_input_embeds(emb.size(0))
+            _adp_mark("forward_launch")
             self._hybrid_scatter()
+            _adp_mark("scatter")
+            if _adp_prof:
+                try:
+                    with open(os.environ.get("XLITE_ADAPTER_PROF_OUT", "/tmp/opencode/adapter_prof.jsonl"), "a") as _f:
+                        _f.write(json.dumps({
+                            "num_reqs": num_reqs, "num_tokens": num_actual_tokens,
+                            "with_prefill": bool(with_prefill),
+                            "total_ms": (_adp_last[0] - _adp_t0) * 1000,
+                            "marks": dict(_adp_marks),
+                        }) + "\n")
+                except Exception:
+                    pass
             return _ensure_output(h[:num_actual_tokens], "xlite hybrid forward")
 
         attn_metadata_router = AttnMetadataRouter(attn_metadata=attn_metadata, device="cpu")
