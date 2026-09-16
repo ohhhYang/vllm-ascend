@@ -1041,6 +1041,59 @@ class XliteWrapper:
         self._dg_max_blocks: int = max(1, vllm_config.model_config.max_model_len //
                                        vllm_config.cache_config.block_size)
 
+        # Optional: delegate the PURE-PREFILL GDN recurrent core to the
+        # vllm-ascend Triton/TBE chunk pipeline (XLITE_GDN_CHUNK=1). Registered
+        # as an xlite C++ hook invoked from ForwardAttnLinear; decode and mixed
+        # steps keep the built-in recurrent kernel, and any callback failure
+        # falls back to it transparently.
+        self._gdn_chunk_cb_registered = False
+        if (os.environ.get("XLITE_GDN_CHUNK", "0") == "1"
+                and xlite_config.attn_type == AttnHybrid):
+            try:
+                from xlite._C import set_gdn_chunk_callback
+                set_gdn_chunk_callback(self._gdn_chunk_callback)
+                self._gdn_chunk_cb_registered = True
+                logger.info("xlite GDN chunk callback enabled: prefill core -> vllm-ascend chunk pipeline")
+            except Exception:
+                logger.exception("xlite GDN chunk callback registration failed; built-in recurrent stays")
+
+    def _gdn_chunk_callback(self, q, k, v, beta, g, state, out, cu_seqlens, seqlen):
+        """xlite C++ hook: run the pure-prefill GDN core via the fused CANN chunk op.
+
+        All tensors are zero-copy BF16 views of xlite pool / kv-cache memory on
+        the current NPU stream (xlite C++ launches on torch's current stream,
+        so kernel ordering is automatic). xlite already applied L2 norm to q/k
+        and expanded them to the value-head count. Writes `out` and updates
+        `state` in place; returns True on success (False/exception -> the C++
+        caller falls back to the built-in recurrent kernel).
+
+        Layout notes: the fused op takes TND activations and the vllm state
+        convention [N, Nv, Dv, Dk]; xlite keeps state as [B, H, K, V], so the
+        state is transposed in/out (tiny [B,H,128,128] copies). The op does
+        NOT apply q/k L2 norm or g cumsum internally; xlite's q/k are already
+        L2-normed and its raw log-space g is passed through, matching
+        vllm-ascend gdn.py's own fused-path call.
+        """
+        B, H = state.shape[0], state.shape[1]
+        T = q.shape[0]
+        K = q.shape[1] // H
+        V = v.shape[1] // H
+        # from_blob views of xlite pool memory are not allocator-backed; the
+        # fused CANN op misreads them (silent garbage). Clone to real tensors.
+        state_vk = state.transpose(-1, -2).contiguous()
+        asl = torch.tensor([cu_seqlens[i + 1] - cu_seqlens[i] for i in range(B)],
+                           dtype=torch.int32, device=q.device)
+        o, final_state = torch_npu.npu_chunk_gated_delta_rule(
+            q.view(T, H, K).clone(), k.view(T, H, K).clone(), v.view(T, H, V).clone(),
+            beta=beta.view(T, H).clone(), initial_state=state_vk,
+            actual_seq_lengths=asl, scale=K ** -0.5, g=g.view(T, H).float())
+        out.view(T, H, V).copy_(o)
+        state.copy_(final_state.transpose(-1, -2))
+        # The C++ caller resumes xlite kernels on rt.stream right after this
+        # hook; make sure the op and the copies above are complete first.
+        torch.npu.synchronize()
+        return True
+
     def _dg_meta_host(self, num_reqs, cached_lens_list, block_tables_list):
         """Replicate C++ PrepareAttn V1 host logic exactly (xlite formula):
         slot = block_tables[i][cached//bs] * bs + cached%bs; blockTables padded
