@@ -1078,19 +1078,20 @@ class XliteWrapper:
         T = q.shape[0]
         K = q.shape[1] // H
         V = v.shape[1] // H
-        # from_blob views of xlite pool memory are not allocator-backed; the
-        # fused CANN op misreads them (silent garbage). Clone to real tensors.
+        # q/k/v/beta are zero-copy from_blob views of xlite pool memory; safe
+        # because the C++ trampoline drains rt.stream before this call and
+        # synchronizes after it (all reads/writes are stream-ordered).
         state_vk = state.transpose(-1, -2).contiguous()
         asl = torch.tensor([cu_seqlens[i + 1] - cu_seqlens[i] for i in range(B)],
                            dtype=torch.int32, device=q.device)
         o, final_state = torch_npu.npu_chunk_gated_delta_rule(
-            q.view(T, H, K).clone(), k.view(T, H, K).clone(), v.view(T, H, V).clone(),
-            beta=beta.view(T, H).clone(), initial_state=state_vk,
+            q.view(T, H, K), k.view(T, H, K), v.view(T, H, V),
+            beta=beta.view(T, H), initial_state=state_vk,
             actual_seq_lengths=asl, scale=K ** -0.5, g=g.view(T, H).float())
         out.view(T, H, V).copy_(o)
         state.copy_(final_state.transpose(-1, -2))
-        # The C++ caller resumes xlite kernels on rt.stream right after this
-        # hook; make sure the op and the copies above are complete first.
+        # The C++ trampoline drained rt.stream before this call; make sure the
+        # op and the copies above complete before xlite kernels resume.
         torch.npu.synchronize()
         return True
 
