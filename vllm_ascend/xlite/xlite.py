@@ -1062,10 +1062,12 @@ class XliteWrapper:
 
         All tensors are zero-copy BF16 views of xlite pool / kv-cache memory on
         the current NPU stream (xlite C++ launches on torch's current stream,
-        so kernel ordering is automatic). xlite already applied L2 norm to q/k
-        and expanded them to the value-head count. Writes `out` and updates
-        `state` in place; returns True on success (False/exception -> the C++
-        caller falls back to the built-in recurrent kernel).
+        so kernel ordering is automatic). xlite already applied L2 norm to q/k.
+        q/k arrive UNEXPANDED at their native key-head count (Nk); the fused op
+        natively supports Nk < Nv grouping, so no repeat-interleave expansion
+        is needed on this path. Writes `out` and updates `state` in place;
+        returns True on success (False/exception -> the C++ caller falls back
+        to the built-in recurrent kernel).
 
         Layout notes: the fused op takes TND activations and the vllm state
         convention [N, Nv, Dv, Dk]; xlite keeps state as [B, H, K, V], so the
@@ -1076,8 +1078,9 @@ class XliteWrapper:
         """
         B, H = state.shape[0], state.shape[1]
         T = q.shape[0]
-        K = q.shape[1] // H
-        V = v.shape[1] // H
+        K = state.shape[2]  # head_dim of k (state is [B, H, K, V])
+        V = state.shape[3]
+        Hk = q.shape[1] // K  # key heads (Nk <= H, H % Hk == 0)
         # q/k/v/beta are zero-copy from_blob views of xlite pool memory; safe
         # because the C++ trampoline drains rt.stream before this call and
         # synchronizes after it (all reads/writes are stream-ordered).
@@ -1085,7 +1088,7 @@ class XliteWrapper:
         asl = torch.tensor([cu_seqlens[i + 1] - cu_seqlens[i] for i in range(B)],
                            dtype=torch.int32, device=q.device)
         o, final_state = torch_npu.npu_chunk_gated_delta_rule(
-            q.view(T, H, K), k.view(T, H, K), v.view(T, H, V),
+            q.view(T, Hk, K), k.view(T, Hk, K), v.view(T, H, V),
             beta=beta.view(T, H), initial_state=state_vk,
             actual_seq_lengths=asl, scale=K ** -0.5, g=g.view(T, H).float())
         out.view(T, H, V).copy_(o)
