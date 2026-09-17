@@ -1,6 +1,7 @@
 # mypy: ignore-errors
 import math
 
+import torch
 import vllm.model_executor.models.config
 from vllm.logger import logger
 from vllm.model_executor.models import ModelRegistry
@@ -64,6 +65,37 @@ def verify_and_update_config(cls, vllm_config) -> None:
     # get mamba block size
     mamba_shapes = model_cls.get_mamba_state_shape_from_config(vllm_config)
     mamba_dtypes = model_cls.get_mamba_state_dtype_from_config(vllm_config)
+    # xlite graph mode manages GDN states itself (slot-major bf16 buffers in
+    # the xlite adapter, see xlite.py _adapt_hybrid_kv_caches) and never reads
+    # the vllm-side mamba pages. The model card's mamba_ssm_dtype=float32 then
+    # only inflates the mamba page (3MiB -> block_size 1536, ~20% KV
+    # fragmentation tax) for zero benefit. Keep the accounting consistent by
+    # declaring the ssm state bf16 while xlite owns the states.
+    if cache_config.mamba_ssm_cache_dtype != "bfloat16":
+        import os
+        if os.environ.get("XLITE_MAMBA_SSM_BF16", "1") == "0":
+            _xlite_on = False
+        else:
+            try:
+                from vllm_ascend.ascend_config import get_ascend_config
+                _xlite_graph = getattr(
+                    get_ascend_config(), "xlite_graph_config", None)
+                _xlite_on = bool(_xlite_graph and getattr(_xlite_graph, "enabled", False))
+            except Exception:
+                _xlite_on = False
+            if not _xlite_on:
+                _add = getattr(vllm_config, "additional_config", None) or {}
+                _xc = _add.get("xlite_graph_config") if isinstance(_add, dict) else None
+                _xlite_on = bool(_xc and _xc.get("enabled", False))
+        if _xlite_on:
+            logger.info(
+                "xlite graph mode owns GDN states in bf16; overriding "
+                "mamba_ssm_cache_dtype %s -> bfloat16 to halve the mamba "
+                "page and relax the block_size inflation.",
+                cache_config.mamba_ssm_cache_dtype)
+            cache_config.mamba_ssm_cache_dtype = "bfloat16"
+            mamba_dtypes = tuple(
+                torch.bfloat16 if d == torch.float32 else d for d in mamba_dtypes)
     mamba_sizes = []
     for shape, dtype in zip(mamba_shapes, mamba_dtypes):
         mamba_sizes.append(math.prod(shape) * get_dtype_size(dtype))
