@@ -70,9 +70,39 @@ def verify_and_update_config(cls, vllm_config) -> None:
         vllm_config
     )
     logger.debug("Using kv store: %s", using_kv_store_with_hybrid)
+    cache_config = vllm_config.cache_config
+    # xlite graph mode manages GDN states itself (slot-major bf16 buffers in
+    # the xlite adapter, see xlite.py _adapt_hybrid_kv_caches) and never reads
+    # the vllm-side mamba pages. The model card's mamba_ssm_dtype=float32 then
+    # only inflates the mamba page (3MiB -> block_size 1536, ~20% KV
+    # fragmentation tax) for zero benefit. Keep the accounting consistent by
+    # declaring the ssm state bf16 while xlite owns the states. Must run
+    # before MambaModelConfig.verify_and_update_config consumes the dtype.
+    if cache_config.mamba_ssm_cache_dtype != "bfloat16":
+        import os
+        if os.environ.get("XLITE_MAMBA_SSM_BF16", "1") == "0":
+            _xlite_on = False
+        else:
+            try:
+                from vllm_ascend.ascend_config import get_ascend_config
+                _xlite_graph = getattr(
+                    get_ascend_config(), "xlite_graph_config", None)
+                _xlite_on = bool(_xlite_graph and getattr(_xlite_graph, "enabled", False))
+            except Exception:
+                _xlite_on = False
+            if not _xlite_on:
+                _add = getattr(vllm_config, "additional_config", None) or {}
+                _xc = _add.get("xlite_graph_config") if isinstance(_add, dict) else None
+                _xlite_on = bool(_xc and _xc.get("enabled", False))
+        if _xlite_on:
+            logger.info(
+                "xlite graph mode owns GDN states in bf16; overriding "
+                "mamba_ssm_cache_dtype %s -> bfloat16 to halve the mamba "
+                "page and relax the block_size inflation.",
+                cache_config.mamba_ssm_cache_dtype)
+            cache_config.mamba_ssm_cache_dtype = "bfloat16"
     MambaModelConfig.verify_and_update_config(vllm_config)
 
-    cache_config = vllm_config.cache_config
     model_config = vllm_config.model_config
     index_kpool = _get_sparse_index_kpool(model_config)
     if index_kpool is not None:
