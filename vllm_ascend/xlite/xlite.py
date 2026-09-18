@@ -1047,13 +1047,25 @@ class XliteWrapper:
         # steps keep the built-in recurrent kernel, and any callback failure
         # falls back to it transparently.
         self._gdn_chunk_cb_registered = False
+        self._gdn_chunk_cb_fails = 0
+        self._gdn_chunk_cb_disabled = False
         if (os.environ.get("XLITE_GDN_CHUNK", "0") == "1"
                 and xlite_config.attn_type == AttnHybrid):
             try:
                 from xlite._C import set_gdn_chunk_callback
-                set_gdn_chunk_callback(self._gdn_chunk_callback)
-                self._gdn_chunk_cb_registered = True
-                logger.info("xlite GDN chunk callback enabled: prefill core -> vllm-ascend chunk pipeline")
+                # Probe BEFORE registering: on old torch_npu/CANN the fused op
+                # is absent; registering anyway would raise inside the
+                # callback on EVERY layer/step (exception + double sync each,
+                # silent after 4 C++-side logs). Not registering is free.
+                if not hasattr(torch_npu, "npu_chunk_gated_delta_rule"):
+                    logger.warning(
+                        "torch_npu has no npu_chunk_gated_delta_rule "
+                        "(old torch_npu/CANN); GDN chunk callback NOT "
+                        "registered, built-in recurrent stays")
+                else:
+                    set_gdn_chunk_callback(self._gdn_chunk_callback)
+                    self._gdn_chunk_cb_registered = True
+                    logger.info("xlite GDN chunk callback enabled: prefill core -> vllm-ascend chunk pipeline")
             except Exception:
                 logger.exception("xlite GDN chunk callback registration failed; built-in recurrent stays")
 
@@ -1076,6 +1088,29 @@ class XliteWrapper:
         L2-normed and its raw log-space g is passed through, matching
         vllm-ascend gdn.py's own fused-path call.
         """
+        # Permanent self-disable after repeated failures (e.g. op missing at
+        # runtime, shape/layout regression): without this, every layer/step
+        # retries the op and pays a python exception + double sync each time.
+        if self._gdn_chunk_cb_disabled:
+            return False
+        try:
+            return self._gdn_chunk_call(q, k, v, beta, g, state, out,
+                                        cu_seqlens, seqlen)
+        except Exception:
+            self._gdn_chunk_cb_fails += 1
+            if self._gdn_chunk_cb_fails <= 4:
+                logger.exception(
+                    "xlite GDN chunk callback failed (%d); falling back to recurrent",
+                    self._gdn_chunk_cb_fails)
+            if self._gdn_chunk_cb_fails >= 4:
+                self._gdn_chunk_cb_disabled = True
+                logger.warning(
+                    "xlite GDN chunk callback disabled after %d failures; "
+                    "built-in recurrent stays for the process lifetime",
+                    self._gdn_chunk_cb_fails)
+            return False
+
+    def _gdn_chunk_call(self, q, k, v, beta, g, state, out, cu_seqlens, seqlen):
         B, H = state.shape[0], state.shape[1]
         T = q.shape[0]
         K = state.shape[2]  # head_dim of k (state is [B, H, K, V])
