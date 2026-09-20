@@ -2924,6 +2924,11 @@ class NPUModelRunner(GPUModelRunner):
 
         block_table_gid_0, slot_mapping_gid_0 = _get_block_table_and_slot_mapping(0)
         self.long_seq_metadata, block_table_gid_0 = _get_dcp_metadata(block_table_gid_0)
+        # xlite hybrid path: provide CPU numpy block_table to avoid per-step
+        # D2H sync in xlite.py (38ms/step at B16 from draining the stream).
+        block_table_cpu_np = None
+        if kv_cache_groups and hasattr(self.input_batch.block_table[0], "np"):
+            block_table_cpu_np = self.input_batch.block_table[0].np[:num_reqs_padded]
         num_computed_tokens_cpu = self.input_batch.num_computed_tokens_cpu_tensor[
             :num_reqs_padded
         ]
@@ -2958,6 +2963,7 @@ class NPUModelRunner(GPUModelRunner):
             max_query_len=max_query_len,
             max_seq_len=max_seq_len,
             block_table_tensor=block_table_gid_0,
+            block_table_cpu_np=block_table_cpu_np,
             slot_mapping=slot_mapping_gid_0,
             causal=True,
             is_prefilling=is_prefilling,

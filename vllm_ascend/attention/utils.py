@@ -2,7 +2,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from functools import lru_cache
 from typing import Any
-
+import numpy as np
 import torch
 import torch.nn.functional as F
 import torch_npu
@@ -294,6 +294,12 @@ class AscendCommonAttentionMetadata(CommonAttentionMetadata):
     # resident LRU (adler32-hashed request ids and token->request mapping).
     req_ids_tensor: torch.Tensor | None = None
     token_to_req: torch.Tensor | None = None
+
+    # CPU numpy copy of block_table for xlite hybrid path (avoids per-step
+    # D2H sync which costs 38ms/step at B16 by draining the compute stream).
+    # Set by model_runner when building this metadata; xlite.py reads it
+    # directly instead of calling block_tables.to("cpu").
+    block_table_cpu_np: np.ndarray | None = None
 
     # TODO: Remove it when vLLM no longer uses this function.
     def unpadded(self, num_actual_tokens: int, num_actual_reqs: int) -> "AscendCommonAttentionMetadata":

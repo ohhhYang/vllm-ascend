@@ -1627,17 +1627,23 @@ class XliteWrapper:
                 )
             cached_lens_list = [max(seq_lens_list[i] - query_lens_list[i], 0) for i in range(num_reqs)]
             _adp_mark("lens")
-            bt = getattr(attn_metadata, "block_tables", None)
-            if bt is None:
-                return _ensure_output(
-                    self.runnable(input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs),
-                    "runnable(hybrid block_tables=None)",
+            # xlite B16+ fix: prefer CPU numpy block_table (zero D2H sync,
+            # saves ~38ms/step at B16); fall back to D2H only if unavailable.
+            bt_cpu_np = getattr(attn_metadata, "block_tables_cpu_np", None)
+            if bt_cpu_np is not None:
+                block_tables_list = bt_cpu_np[:num_reqs].tolist()
+            else:
+                bt = getattr(attn_metadata, "block_tables", None)
+                if bt is None:
+                    return _ensure_output(
+                        self.runnable(input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs),
+                        "runnable(hybrid block_tables=None)",
+                    )
+                block_tables_list = (
+                    bt[:num_reqs].detach().to("cpu").tolist()
+                    if hasattr(bt, "device") and bt.device.type != "cpu"
+                    else bt[:num_reqs].tolist()
                 )
-            block_tables_list = (
-                bt[:num_reqs].detach().to("cpu").tolist()
-                if hasattr(bt, "device") and bt.device.type != "cpu"
-                else bt[:num_reqs].tolist()
-            )
             _adp_mark("block_tables")
             num_actual_tokens = int(attn_metadata.num_actual_tokens)
             if sum(query_lens_list) != num_actual_tokens:
