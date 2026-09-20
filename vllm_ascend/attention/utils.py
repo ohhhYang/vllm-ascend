@@ -3,7 +3,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from functools import lru_cache
 from typing import Any
-
+import numpy as np
 import torch
 import torch.nn.functional as F
 from vllm.config import VllmConfig, get_current_vllm_config
@@ -315,6 +315,12 @@ class AscendCommonAttentionMetadata(CommonAttentionMetadata):
     _seq_lens_cpu: torch.Tensor | None = None
     _num_computed_tokens_cpu: torch.Tensor | None = None
     dcp_local_seq_lens_cpu: torch.Tensor | None = None
+
+    # CPU numpy copy of block_table for xlite hybrid path (avoids per-step
+    # D2H sync which costs 38ms/step at B16 by draining the compute stream).
+    # Set by model_runner when building this metadata; xlite.py reads it
+    # directly instead of calling block_tables.to("cpu").
+    block_table_cpu_np: np.ndarray | None = None
 
     # TODO: Remove it when vLLM no longer uses this function.
     def unpadded(self, num_actual_tokens: int, num_actual_reqs: int) -> "AscendCommonAttentionMetadata":
