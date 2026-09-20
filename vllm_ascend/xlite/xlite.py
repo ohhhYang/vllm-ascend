@@ -1046,10 +1046,14 @@ class XliteWrapper:
         # as an xlite C++ hook invoked from ForwardAttnLinear; decode and mixed
         # steps keep the built-in recurrent kernel, and any callback failure
         # falls back to it transparently.
+        # Graduated 2026-09-19 after ceval gate passed (TP1 104 同题: xlite
+        # 87.5% vs native 83.65%, 0 题退化). Default ON; set XLITE_GDN_CHUNK=0
+        # to opt out. Fallback chain: hasattr probe -> 4-fail self-disable ->
+        # built-in recurrent.
         self._gdn_chunk_cb_registered = False
         self._gdn_chunk_cb_fails = 0
         self._gdn_chunk_cb_disabled = False
-        if (os.environ.get("XLITE_GDN_CHUNK", "0") == "1"
+        if (os.environ.get("XLITE_GDN_CHUNK", "1") == "1"
                 and xlite_config.attn_type == AttnHybrid):
             try:
                 from xlite._C import set_gdn_chunk_callback
