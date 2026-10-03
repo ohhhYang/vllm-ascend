@@ -32,7 +32,7 @@ class TorchNPUProfilerWrapper(WorkerProfiler):
 
     def __init__(self, profiler_config: ProfilerConfig, trace_name: str) -> None:
         super().__init__(profiler_config)
-        self.profiler: Any = self._create_profiler(profiler_config, trace_name)
+        self.profiler, self._schedule = self._create_profiler(profiler_config, trace_name)
 
     @staticmethod
     def _create_profiler(profiler_config: ProfilerConfig, trace_name: str) -> Any:
@@ -66,10 +66,13 @@ class TorchNPUProfilerWrapper(WorkerProfiler):
         # schedule-based export happens mid-run and is unaffected.
         schedule = None
         if profiler_config.max_iterations > 0:
+            # keep a margin below the base class auto-stop threshold
+            # (profiling_for_iters > max_iterations) so that on_trace_ready
+            # fires ~5 steps before _call_stop() races it.
             schedule = torch_npu.profiler.schedule(
                 wait=0,
                 warmup=1,
-                active=profiler_config.max_iterations,
+                active=max(profiler_config.max_iterations - 5, 10),
                 repeat=1,
                 skip_first=0,
             )
@@ -90,7 +93,7 @@ class TorchNPUProfilerWrapper(WorkerProfiler):
                 profiler_config.torch_profiler_dir,
                 worker_name=trace_name,
             ),
-        )
+        ), schedule
 
     def _start(self) -> None:
         self.profiler.start()
@@ -99,4 +102,8 @@ class TorchNPUProfilerWrapper(WorkerProfiler):
         self.profiler.stop()
 
     def _profiler_step(self) -> bool:
+        if self._schedule is not None:
+            # drive the schedule state machine; on_trace_ready fires at the
+            # end of the active window while the worker is still alive
+            self.profiler.step()
         return True
