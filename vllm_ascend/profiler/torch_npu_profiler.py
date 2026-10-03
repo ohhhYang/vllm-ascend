@@ -58,11 +58,28 @@ class TorchNPUProfilerWrapper(WorkerProfiler):
             gc_detect_threshold=None,
         )
 
+        # When max_iterations is set, use a step-based schedule so that
+        # on_trace_ready fires at the end of the active window while the
+        # worker process is still alive. Rationale: on this environment the
+        # stop-time msprof finalize/parse path crashes natively (SIGSEGV in
+        # the worker at profiler.stop()), losing the trace entirely; the
+        # schedule-based export happens mid-run and is unaffected.
+        schedule = None
+        if profiler_config.max_iterations > 0:
+            schedule = torch_npu.profiler.schedule(
+                wait=0,
+                warmup=1,
+                active=profiler_config.max_iterations,
+                repeat=1,
+                skip_first=0,
+            )
+
         return torch_npu.profiler.profile(
             activities=[
                 torch_npu.profiler.ProfilerActivity.CPU,
                 torch_npu.profiler.ProfilerActivity.NPU,
             ],
+            schedule=schedule,
             with_stack=False,
             profile_memory=profiler_config.torch_profiler_with_memory,
             # NOTE: torch_npu.profiler.with_modules is equivalent to torch.profiler.with_stack.
