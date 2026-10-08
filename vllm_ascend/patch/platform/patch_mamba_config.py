@@ -80,13 +80,14 @@ def verify_and_update_config(cls, vllm_config) -> None:
     # before MambaModelConfig.verify_and_update_config consumes the dtype.
     if cache_config.mamba_ssm_cache_dtype != "bfloat16":
         import os
+
         if os.environ.get("XLITE_MAMBA_SSM_BF16", "1") == "0":
             _xlite_on = False
         else:
             try:
                 from vllm_ascend.ascend_config import get_ascend_config
-                _xlite_graph = getattr(
-                    get_ascend_config(), "xlite_graph_config", None)
+
+                _xlite_graph = getattr(get_ascend_config(), "xlite_graph_config", None)
                 _xlite_on = bool(_xlite_graph and getattr(_xlite_graph, "enabled", False))
             except Exception:
                 _xlite_on = False
@@ -99,7 +100,8 @@ def verify_and_update_config(cls, vllm_config) -> None:
                 "xlite graph mode owns GDN states in bf16; overriding "
                 "mamba_ssm_cache_dtype %s -> bfloat16 to halve the mamba "
                 "page and relax the block_size inflation.",
-                cache_config.mamba_ssm_cache_dtype)
+                cache_config.mamba_ssm_cache_dtype,
+            )
             cache_config.mamba_ssm_cache_dtype = "bfloat16"
     MambaModelConfig.verify_and_update_config(vllm_config)
 
