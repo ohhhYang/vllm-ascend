@@ -35,9 +35,6 @@ from xlite._C import AttnDSA, AttnHybrid, AttnMeta, AttnMHA, AttnMLA, Runtime, S
 
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.attention.attention_v1 import AscendAttentionBackend, AscendAttentionState, AscendMetadata
-from vllm_ascend.attention.mla_v1 import AscendMLAMetadata
-from vllm_ascend.attention.sfa_v1 import AscendSFAMetadata
-from vllm_ascend.compilation.acl_graph import ACLGraphWrapper
 from vllm_ascend.ops.rotary_embedding import AscendRotaryEmbedding
 from vllm_ascend.xlite.utils import (
     AttnMetadataRouter,
@@ -765,8 +762,10 @@ class Qwen3_5XliteModel(StandardXliteModel):
         xm.embed = get_dotted_attr(self.npu_runnable, f"{prefix}model.embed_tokens.weight", raises=True)
         norm_w = _gemma_norm_to_xlite(get_dotted_attr(self.npu_runnable, f"{prefix}model.norm.weight", raises=True))
         xm.norm = norm_w
-        xm.head = xm.embed if hf.tie_word_embeddings else get_dotted_attr(
-            self.npu_runnable, f"{prefix}lm_head.weight", raises=True
+        xm.head = (
+            xm.embed
+            if hf.tie_word_embeddings
+            else get_dotted_attr(self.npu_runnable, f"{prefix}lm_head.weight", raises=True)
         )
 
         empty = torch.empty(0, dtype=xm.embed.dtype, device=xm.embed.device)
@@ -776,12 +775,29 @@ class Qwen3_5XliteModel(StandardXliteModel):
         key_dim = (hf.linear_num_key_heads * hf.linear_key_head_dim) // tp
         value_dim = (hf.linear_num_value_heads * hf.linear_value_head_dim) // tp
 
-        lists: dict[str, list[torch.Tensor]] = {k: [] for k in (
-            "attn_norm", "mlp_norm", "mlp_up_gate", "mlp_down", "attn_out",
-            "mha_qkv", "mha_qkv_bias", "mha_q_norm", "mha_k_norm",
-            "linear_in_proj_qkv", "linear_in_proj_z", "linear_in_proj_b", "linear_in_proj_a",
-            "linear_conv1d", "linear_a_log", "linear_dt_bias", "linear_norm", "linear_out_proj",
-        )}
+        lists: dict[str, list[torch.Tensor]] = {
+            k: []
+            for k in (
+                "attn_norm",
+                "mlp_norm",
+                "mlp_up_gate",
+                "mlp_down",
+                "attn_out",
+                "mha_qkv",
+                "mha_qkv_bias",
+                "mha_q_norm",
+                "mha_k_norm",
+                "linear_in_proj_qkv",
+                "linear_in_proj_z",
+                "linear_in_proj_b",
+                "linear_in_proj_a",
+                "linear_conv1d",
+                "linear_a_log",
+                "linear_dt_bias",
+                "linear_norm",
+                "linear_out_proj",
+            )
+        }
         has_qkv_bias = False
 
         for layer in layers:
@@ -817,8 +833,15 @@ class Qwen3_5XliteModel(StandardXliteModel):
                 else:
                     lists["mha_qkv_bias"].append(empty)
                 for k in (
-                    "linear_in_proj_qkv", "linear_in_proj_z", "linear_in_proj_b", "linear_in_proj_a",
-                    "linear_conv1d", "linear_a_log", "linear_dt_bias", "linear_norm", "linear_out_proj",
+                    "linear_in_proj_qkv",
+                    "linear_in_proj_z",
+                    "linear_in_proj_b",
+                    "linear_in_proj_a",
+                    "linear_conv1d",
+                    "linear_a_log",
+                    "linear_dt_bias",
+                    "linear_norm",
+                    "linear_out_proj",
                 ):
                     lists[k].append(empty)
             else:
@@ -850,7 +873,6 @@ class Qwen3_5XliteModel(StandardXliteModel):
             setattr(xm, k, v)
         cfg.qk_norm = True
         cfg.qkv_bias = has_qkv_bias
-
 
 
 def get_adapter_xlite_model(npu_runner: "XliteModelRunner", vllm_config: VllmConfig) -> XliteModelBase:
@@ -1076,7 +1098,12 @@ class XliteWrapper:
             # Already kernel layout, or split manager page into kernel blocks.
             if k.shape[1] == block_size and k.shape[2:] == (kv_heads, head_dim):
                 return k, v
-            if k.ndim == 4 and k.shape[1] > block_size and k.shape[1] % block_size == 0 and k.shape[2:] == (kv_heads, head_dim):
+            if (
+                k.ndim == 4
+                and k.shape[1] > block_size
+                and k.shape[1] % block_size == 0
+                and k.shape[2:] == (kv_heads, head_dim)
+            ):
                 chunk = k.shape[1] // block_size
                 return (
                     k.view(k.shape[0] * chunk, block_size, kv_heads, head_dim),
@@ -1110,9 +1137,11 @@ class XliteWrapper:
                 return None
             if len(cands) == 1 or expected_type is not AscendMetadata:
                 return cands[0]
+
             def score(m: Any) -> int:
                 bt = getattr(m, "block_tables", None)
                 return int(bt.shape[-1]) if bt is not None and hasattr(bt, "shape") else -1
+
             return max(cands, key=score)
         return None
 
@@ -1251,12 +1280,20 @@ class XliteWrapper:
             xlite_attn_metadata.block_tables_cpu = block_tables_list
             pos = positions[0] if positions.ndim == 2 else positions
             xlite_attn_metadata.positions = pos[:num_actual_tokens].contiguous()
-            num_tokens = getattr(forward_context, "max_tokens_across_dp", None) or forward_context.batch_descriptor.num_tokens
+            num_tokens = (
+                getattr(forward_context, "max_tokens_across_dp", None) or forward_context.batch_descriptor.num_tokens
+            )
             h = self.hidden_states[:num_tokens]
             stream = torch.npu.current_stream().npu_stream
             if inputs_embeds is None:
                 self.xlite_model.forward(
-                    self.xlite_rt, input_ids[:num_actual_tokens], xlite_attn_metadata, self.kv_caches, self.freq_cis, h, stream
+                    self.xlite_rt,
+                    input_ids[:num_actual_tokens],
+                    xlite_attn_metadata,
+                    self.kv_caches,
+                    self.freq_cis,
+                    h,
+                    stream,
                 )
             else:
                 emb = inputs_embeds[:num_actual_tokens]
