@@ -74,8 +74,8 @@ def verify_and_update_config(cls, vllm_config) -> None:
     # xlite graph mode manages GDN states itself (slot-major bf16 buffers in
     # the xlite adapter, see xlite.py _adapt_hybrid_kv_caches) and never reads
     # the vllm-side mamba pages. The model card's mamba_ssm_dtype=float32 then
-    # only inflates the mamba page (3MiB -> block_size 1536, ~20% KV
-    # fragmentation tax) for zero benefit. Keep the accounting consistent by
+    # only inflates the mamba page (coarser block size, fragmented KV pool)
+    # for zero benefit. Keep the accounting consistent by
     # declaring the ssm state bf16 while xlite owns the states. Must run
     # before MambaModelConfig.verify_and_update_config consumes the dtype.
     if cache_config.mamba_ssm_cache_dtype != "bfloat16":
