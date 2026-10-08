@@ -930,10 +930,10 @@ class XliteWrapper:
         # as an xlite C++ hook invoked from ForwardAttnLinear; decode and mixed
         # steps keep the built-in recurrent kernel, and any callback failure
         # falls back to it transparently.
-        # Graduated 2026-09-19 after ceval gate passed (TP1 104 同题: xlite
-        # 87.5% vs native 83.65%, 0 题退化). Default ON; set XLITE_GDN_CHUNK=0
-        # to opt out. Fallback chain: hasattr probe -> 4-fail self-disable ->
-        # built-in recurrent.
+        # Graduated to default-on after an accuracy gate against the native
+        # path (same-prompt eval, no regressions). Default ON; set
+        # XLITE_GDN_CHUNK=0 to opt out. Fallback chain: hasattr probe ->
+        # 4-fail self-disable -> built-in recurrent.
         self._gdn_chunk_cb_registered = False
         self._gdn_chunk_cb_fails = 0
         self._gdn_chunk_cb_disabled = False
