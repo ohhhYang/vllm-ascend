@@ -316,8 +316,8 @@ class AscendCommonAttentionMetadata(CommonAttentionMetadata):
     _num_computed_tokens_cpu: torch.Tensor | None = None
     dcp_local_seq_lens_cpu: torch.Tensor | None = None
 
-    # CPU numpy copy of block_table for xlite hybrid path (avoids per-step
-    # D2H sync which costs 38ms/step at B16 by draining the compute stream).
+    # CPU numpy copy of block_table for the xlite hybrid path: reading it
+    # avoids a per-step D2H sync that drains the compute stream.
     # Set by model_runner when building this metadata; xlite.py reads it
     # directly instead of calling block_tables.to("cpu").
     block_table_cpu_np: np.ndarray | None = None
