@@ -17,6 +17,7 @@
 """Xlite integration module for vLLM-Ascend."""
 
 import math
+import os
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
 from typing import TYPE_CHECKING, Any, TypeAlias, cast
@@ -959,10 +960,10 @@ class XliteWrapper:
         self._gdn_chunk_cb_registered = False
         self._gdn_chunk_cb_fails = 0
         self._gdn_chunk_cb_disabled = False
-        if (os.environ.get("XLITE_GDN_CHUNK", "1") == "1"
-                and xlite_config.attn_type == AttnHybrid):
+        if os.environ.get("XLITE_GDN_CHUNK", "1") == "1" and xlite_config.attn_type == AttnHybrid:
             try:
                 from xlite._C import set_gdn_chunk_callback
+
                 # Probe BEFORE registering: on old torch_npu/CANN the fused op
                 # is absent; registering anyway would raise inside the
                 # callback on EVERY layer/step (exception + double sync each,
@@ -971,7 +972,8 @@ class XliteWrapper:
                     logger.warning(
                         "torch_npu has no npu_chunk_gated_delta_rule "
                         "(old torch_npu/CANN); GDN chunk callback NOT "
-                        "registered, built-in recurrent stays")
+                        "registered, built-in recurrent stays"
+                    )
                 else:
                     set_gdn_chunk_callback(self._gdn_chunk_callback)
                     self._gdn_chunk_cb_registered = True
@@ -1004,20 +1006,20 @@ class XliteWrapper:
         if self._gdn_chunk_cb_disabled:
             return False
         try:
-            return self._gdn_chunk_call(q, k, v, beta, g, state, out,
-                                        cu_seqlens, seqlen)
+            return self._gdn_chunk_call(q, k, v, beta, g, state, out, cu_seqlens, seqlen)
         except Exception:
             self._gdn_chunk_cb_fails += 1
             if self._gdn_chunk_cb_fails <= 4:
                 logger.exception(
-                    "xlite GDN chunk callback failed (%d); falling back to recurrent",
-                    self._gdn_chunk_cb_fails)
+                    "xlite GDN chunk callback failed (%d); falling back to recurrent", self._gdn_chunk_cb_fails
+                )
             if self._gdn_chunk_cb_fails >= 4:
                 self._gdn_chunk_cb_disabled = True
                 logger.warning(
                     "xlite GDN chunk callback disabled after %d failures; "
                     "built-in recurrent stays for the process lifetime",
-                    self._gdn_chunk_cb_fails)
+                    self._gdn_chunk_cb_fails,
+                )
             return False
 
     def _gdn_chunk_call(self, q, k, v, beta, g, state, out, cu_seqlens, seqlen):
@@ -1030,12 +1032,17 @@ class XliteWrapper:
         # because the C++ trampoline drains rt.stream before this call and
         # synchronizes after it (all reads/writes are stream-ordered).
         state_vk = state.transpose(-1, -2).contiguous()
-        asl = torch.tensor([cu_seqlens[i + 1] - cu_seqlens[i] for i in range(B)],
-                           dtype=torch.int32, device=q.device)
+        asl = torch.tensor([cu_seqlens[i + 1] - cu_seqlens[i] for i in range(B)], dtype=torch.int32, device=q.device)
         o, final_state = torch_npu.npu_chunk_gated_delta_rule(
-            q.view(T, Hk, K), k.view(T, Hk, K), v.view(T, H, V),
-            beta=beta.view(T, H), initial_state=state_vk,
-            actual_seq_lengths=asl, scale=K ** -0.5, g=g.view(T, H).float())
+            q.view(T, Hk, K),
+            k.view(T, Hk, K),
+            v.view(T, H, V),
+            beta=beta.view(T, H),
+            initial_state=state_vk,
+            actual_seq_lengths=asl,
+            scale=K**-0.5,
+            g=g.view(T, H).float(),
+        )
         out.view(T, H, V).copy_(o)
         state.copy_(final_state.transpose(-1, -2))
         # The C++ trampoline drained rt.stream before this call; make sure the
