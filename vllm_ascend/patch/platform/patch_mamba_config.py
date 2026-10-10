@@ -78,7 +78,7 @@ def verify_and_update_config(cls, vllm_config) -> None:
     # for zero benefit. Keep the accounting consistent by
     # declaring the ssm state bf16 while xlite owns the states. Must run
     # before MambaModelConfig.verify_and_update_config consumes the dtype.
-    if cache_config.mamba_ssm_cache_dtype != "bfloat16":
+    if getattr(cache_config, "mamba_ssm_cache_dtype", "auto") != "bfloat16":
         import os
 
         if os.environ.get("XLITE_MAMBA_SSM_BF16", "1") == "0":
